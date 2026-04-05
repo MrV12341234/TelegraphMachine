@@ -9,7 +9,8 @@
 #define OLED_ADDR 0x3C
 
 // ---------------- Pins ----------------
-const int BUTTON_PIN = 2;
+const int BUTTON_PIN = 2;         // send button
+const int CANCEL_BUTTON_PIN = 3;  // cancel current send
 const int BUZZER_PIN = 6;
 
 // Board A D11 -> Board B D10
@@ -55,7 +56,8 @@ enum Mode {
 enum OverlayType {
   OVERLAY_NONE,
   OVERLAY_SENT,
-  OVERLAY_RX_FINISHED
+  OVERLAY_RX_FINISHED,
+  OVERLAY_CANCELED
 };
 
 Mode mode = MODE_IDLE;
@@ -71,6 +73,10 @@ bool stableButton = HIGH;
 unsigned long lastDebounceTime = 0;
 unsigned long pressStartTime = 0;
 
+bool lastRawCancelButton = HIGH;
+bool stableCancelButton = HIGH;
+unsigned long lastCancelDebounceTime = 0;
+
 unsigned long lastSymbolReleaseTime = 0;
 bool hasMessageContent = false;
 bool startTokenSent = false;
@@ -84,6 +90,14 @@ void clearBuffers() {
   messageBuffer[0] = '\0';
   currentWord[0] = '\0';
   currentLetter[0] = '\0';
+}
+
+void clearSessionFlags() {
+  hasMessageContent = false;
+  startTokenSent = false;
+  letterGapCommitted = false;
+  wordGapCommitted = false;
+  lastSymbolReleaseTime = 0;
 }
 
 bool overlayActive() {
@@ -128,6 +142,13 @@ void sendToken(char c) {
   linkSerial.write(c);
 }
 
+void forceIdleState() {
+  clearBuffers();
+  clearOverlay();
+  clearSessionFlags();
+  mode = MODE_IDLE;
+}
+
 // ---------------- Buffer builders ----------------
 void finalizeCurrentLetterToWord() {
   if (currentLetter[0] == '\0') return;
@@ -155,11 +176,7 @@ void startSendingSession() {
   clearOverlay();
 
   mode = MODE_SENDING;
-  hasMessageContent = false;
-  startTokenSent = false;
-  letterGapCommitted = false;
-  wordGapCommitted = false;
-  lastSymbolReleaseTime = 0;
+  clearSessionFlags();
 }
 
 void finishSendingSession() {
@@ -180,15 +197,13 @@ void finishSendingSession() {
   showOverlay(OVERLAY_SENT);
 
   clearBuffers();
-  hasMessageContent = false;
-  startTokenSent = false;
-  letterGapCommitted = false;
-  wordGapCommitted = false;
+  clearSessionFlags();
 }
 
 void startReceivingSession() {
   clearBuffers();
   clearOverlay();
+  clearSessionFlags();
   mode = MODE_RECEIVING;
 }
 
@@ -206,9 +221,19 @@ void finishReceivingSession() {
 
 void clearReceivedMessage() {
   sendToken('C');   // tell sender it may return to idle
-  clearBuffers();
-  clearOverlay();
-  mode = MODE_IDLE;
+  forceIdleState();
+}
+
+void cancelSendingSession() {
+  if (mode != MODE_SENDING) return;
+
+  // Only notify the other box if this message had already started
+  if (startTokenSent) {
+    sendToken('X');   // cancel token
+  }
+
+  forceIdleState();
+  showOverlay(OVERLAY_CANCELED);
 }
 
 // ---------------- Incoming serial ----------------
@@ -220,12 +245,18 @@ void clearReceivedMessage() {
 // '>' = flush final word without slash
 // '|' = end of message
 // 'C' = receiver cleared message
+// 'X' = sender canceled current message
 void handleIncomingToken(char token) {
+  if (token == 'X') {
+    // Sender canceled current message. Both sides return to idle.
+    forceIdleState();
+    showOverlay(OVERLAY_CANCELED);
+    return;
+  }
+
   if (token == 'C') {
     if (mode == MODE_WAIT_CLEAR) {
-      clearBuffers();
-      clearOverlay();
-      mode = MODE_IDLE;
+      forceIdleState();
     }
     return;
   }
@@ -276,6 +307,28 @@ void processIncomingSerial() {
 }
 
 // ---------------- Button handling ----------------
+void processCancelButton() {
+  bool raw = digitalRead(CANCEL_BUTTON_PIN);
+
+  if (raw != lastRawCancelButton) {
+    lastCancelDebounceTime = millis();
+    lastRawCancelButton = raw;
+  }
+
+  if ((millis() - lastCancelDebounceTime) <= DEBOUNCE_MS) return;
+
+  if (raw != stableCancelButton) {
+    stableCancelButton = raw;
+
+    // Button pressed
+    if (stableCancelButton == LOW) {
+      if (mode == MODE_SENDING) {
+        cancelSendingSession();
+      }
+    }
+  }
+}
+
 void processButton() {
   bool raw = digitalRead(BUTTON_PIN);
 
@@ -403,7 +456,12 @@ void drawOverlay() {
     display.setCursor(0, 8);
     display.println(F("Message finished"));
     display.setCursor(0, 24);
-    display.println(F("Press btn to clear"));
+    display.println(F("Press down to clear"));
+  } else if (overlayType == OVERLAY_CANCELED) {
+    display.setCursor(0, 8);
+    display.println(F("Message canceled..."));
+    display.setCursor(0, 24);
+    display.println(F("Going back home"));
   }
 
   display.display();
@@ -424,15 +482,15 @@ void renderDisplay() {
 
   display.setCursor(0, 0);
   if (mode == MODE_IDLE) {
-    display.println(F("Press btn to send"));
+    display.println(F("Press down to start a message"));
   } else if (mode == MODE_SENDING) {
-    display.println(F("Sending..."));
+    display.println(F("Type your message"));
   } else if (mode == MODE_RECEIVING) {
-    display.println(F("Incoming message"));
+    display.println(F("Incoming message:"));
   } else if (mode == MODE_RX_DONE) {
-    display.println(F("Press btn to clear"));
+    display.println(F("Press down to clear"));
   } else if (mode == MODE_WAIT_CLEAR) {
-    display.println(F("Waiting on clear"));
+    display.println(F("Message Sent..."));
   }
 
   beginBodyText();
@@ -444,7 +502,16 @@ void renderDisplay() {
   } else if (mode == MODE_RECEIVING || mode == MODE_RX_DONE) {
     drawBodyText(messageBuffer); // receiver only shows completed words
   } else if (mode == MODE_WAIT_CLEAR) {
-    drawBodyText("Receiver decoding");
+    drawBodyText("Receiver is decoding.");
+    bodyRow += 2;   // skip one blank line
+    bodyCol = 0;
+    drawBodyText("They will clear");
+    bodyRow += 1;   // goto next line
+    bodyCol = 0;
+    drawBodyText("messages when");
+    bodyRow += 1;   // goto next line
+    bodyCol = 0;
+    drawBodyText("finished");
   }
 
   display.display();
@@ -453,6 +520,7 @@ void renderDisplay() {
 // ---------------- Setup / Loop ----------------
 void setup() {
   pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(CANCEL_BUTTON_PIN, INPUT_PULLUP);
   pinMode(BUZZER_PIN, OUTPUT);
 
   Wire.begin();
@@ -464,17 +532,19 @@ void setup() {
 
   clearBuffers();
   clearOverlay();
+  clearSessionFlags();
 
   display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
   display.setCursor(0, 0);
-  display.println(F("Press btn to send"));
+  display.println(F("Press down to send"));
   display.display();
 }
 
 void loop() {
   processIncomingSerial();
+  processCancelButton();
   processButton();
   processSendingGapTimers();
   renderDisplay();
