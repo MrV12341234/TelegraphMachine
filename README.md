@@ -22,3 +22,5 @@ Board B D11 → Board A D10
 Board A GND → Board B GND
 Board A 5V → Board B 5V
 (this connection eliminates the need to power the second nano with a power source)
+
+end.
