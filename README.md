@@ -1,4 +1,4 @@
-This Machine uses little Telegraph DIY kits, adding an Arduino Nano and 
+This Machine uses Telegraph DIY kits, adding an Arduino Nano and 
 OLED screen to send and receive telegrams.
 
 Operation:
